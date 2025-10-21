@@ -1,9 +1,14 @@
+from flask import Flask, request, abort
 from google.cloud import storage
 from google.cloud import aiplatform
 import os
+import json # For parsing Eventarc's JSON payload
 
 # Import the specific classes for Gemini models
 from vertexai.preview.generative_models import GenerativeModel, Part, GenerationConfig
+
+# Initialize Flask app
+app = Flask(__name__)
 
 # Initialize Google Cloud Storage client
 storage_client = storage.Client()
@@ -11,47 +16,71 @@ storage_client = storage.Client()
 # Initialize Vertex AI client
 # Make sure 'My Firts Project' is replaced with your actual Google Cloud Project ID
 # and 'us-central1' with your desired region where Gemini is available.
-aiplatform.init(project=os.environ.get('GCP_PROJECT', 'My First Project'), location='us-central1')
+# It's better to use an environment variable for project ID in Cloud Run
+project_id = os.environ.get('GCP_PROJECT', 'My Firts Project') # GCP_PROJECT is often auto-set
+aiplatform.init(project=project_id, location='us-central1')
 
-# --- Global or function-level initialization for the model ---
-# It's often better to initialize the model once globally if your Cloud Run service
-# will handle many requests, to avoid re-initializing on every invocation.
-# However, if your Cloud Run instance spins up and down frequently (scales to zero),
-# initializing inside the function is also fine.
+# --- Global initialization for the model ---
+# This ensures the model is loaded once when the container starts.
 model = GenerativeModel("gemini-1.5-flash") # Or "gemini-1.5-flash" for the latest stable
 
-# Define generation configuration (optional, but good practice)
-# You can adjust temperature, top_p, top_k as needed for your desired output
+# Define generation configuration (optional)
 config = GenerationConfig(
-    temperature=0.1,    # Lower values make the output more deterministic
-    top_p=0.95,         # Nucleus sampling: only consider tokens from the top p probability mass
-    top_k=40,           # K sampling: only consider the top k tokens
-    max_output_tokens=2048 # Adjust based on expected output length
+    temperature=0.1,
+    top_p=0.95,
+    top_k=40,
+    max_output_tokens=2048
 )
 
-def process_document(event, context):
-    """
-    Cloud Run service entry point triggered by a new file in GCS.
-    """
-    bucket_name = event['bucket']
-    file_name = event['name']
+# Define the entry point for Cloud Run
+# Cloud Run expects your app to listen on the port defined by the PORT environment variable
+@app.route('/', methods=['POST'])
+def index():
+    # Eventarc sends events as a JSON payload in the request body
+    # It wraps the actual Cloud Storage event data
+    envelope = request.get_json()
+    if not envelope:
+        msg = 'no Pub/Sub message received'
+        print(f'error: {msg}')
+        return f'Bad Request: {msg}', 400
 
-    input_bucket = storage_client.bucket(bucket_name)
-    input_blob = input_bucket.blob(file_name)
+    if not isinstance(envelope, dict) or 'message' not in envelope:
+        msg = 'invalid Pub/Sub message format'
+        print(f'error: {msg}')
+        return f'Bad Request: {msg}', 400
 
-
-    output_bucket_name = os.environ.get('OUTPUT_BUCKET_NAME', 'poc-curated-data')
-    output_bucket = storage_client.bucket(output_bucket_name)
-
-    print(f"Processing file: {file_name} from bucket: {bucket_name}")
+    # The actual event data is in the 'message.data' field of the Pub/Sub message
+    # And then Base64 decoded, which Eventarc usually handles before sending to Cloud Run.
+    # However, for direct Cloud Storage event, the structure might be different.
+    # Let's assume Eventarc passes the Cloud Storage event directly in the request body
+    # for simplicity, as it often does for Cloud Run targets.
 
     try:
-        # 1. Read the document
+        # Eventarc for Cloud Run usually sends the *actual* Cloud Storage event payload directly
+        # in the POST request body, not wrapped in a Pub/Sub message for GCS events.
+        # If you are using Pub/Sub as an intermediary, you would decode.
+        # Let's assume direct Cloud Storage event structure in the POST body.
+        event_data = request.get_json()
+
+        if not event_data or 'bucket' not in event_data or 'name' not in event_data:
+            raise ValueError("Invalid Cloud Storage event payload received.")
+
+        bucket_name = event_data['bucket']
+        file_name = event_data['name']
+
+        input_bucket = storage_client.bucket(bucket_name)
+        input_blob = input_bucket.blob(file_name)
+
+        output_bucket_name = os.environ.get('OUTPUT_BUCKET_NAME', 'poc-curated-data')
+        output_bucket = storage_client.bucket(output_bucket_name)
+
+        print(f"Processing file: {file_name} from bucket: {bucket_name}")
+
+        
         document_content = input_blob.download_as_text()
         print(f"Document content read. Length: {len(document_content)} bytes.")
 
-        # --- Injecting your prompt and document content ---
-        # Define your specific instructions for Gemini
+       
         user_instructions = (
             "You are an expert data formatter tasked with manipulating text documents."
             "Your task is to analyze the following document, extract key entities "
@@ -63,30 +92,30 @@ def process_document(event, context):
             "Export manipulated objects as a txt file"
         )
 
-        # Combine your instructions with the document content
-        # The document content itself becomes part of the prompt
         full_prompt_for_gemini = f"{user_instructions}\n\nDocument:\n{document_content}"
 
         print("Invoking Gemini 1.5 Flash...")
         # 2. Invoke Vertex AI Gemini 1.5 Flash
         response = model.generate_content(
             contents=[Part.from_text(full_prompt_for_gemini)],
-            generation_config=config, # Pass your defined configuration
+            generation_config=config,
         )
 
-        # Access the generated text from the response
         if response.candidates:
             transformed_content = response.candidates[0].text
             print("Gemini response received.")
-            # You might want to add JSON parsing and validation here
-            # e.g., json_output = json.loads(transformed_content)
+            # Optional: Add JSON parsing and validation here if expecting JSON output
+            # try:
+            #     json_output = json.loads(transformed_content)
+            #     # Further process json_output if needed
+            # except json.JSONDecodeError:
+            #     print("Warning: Gemini did not return valid JSON.")
         else:
             print("No candidates found in Gemini response.")
             transformed_content = "Error: No content generated by Gemini."
+            # Consider raising an exception or signaling a failure to Eventarc
+            # return 'Processing failed: No Gemini content', 500
 
-        # --- Decide on the output file name and path ---
-        # You might want to save the output with a different prefix or extension,
-        # especially if it's now JSON.
         output_blob_name = f"curated/{os.path.splitext(file_name)[0]}.json"
         output_blob = output_bucket.blob(output_blob_name)
 
@@ -94,8 +123,14 @@ def process_document(event, context):
         output_blob.upload_from_string(transformed_content)
         print(f"Curated document '{output_blob_name}' uploaded to '{output_bucket_name}'.")
 
+        return 'Document processed successfully', 200
+
     except Exception as e:
-        print(f"Error processing document {file_name}: {e}")
-        # Consider moving the failed file to a DLQ bucket here
-        # input_blob.copy(storage_client.bucket('your-dlq-bucket').blob(f"failed/{file_name}"))
-        raise # Re-raise to indicate failure, allowing Eventarc to retry
+        print(f"Error processing document {file_name if 'file_name' in locals() else 'unknown'}: {e}")
+        # Return an error status code to Eventarc so it can retry
+        return f'Error processing document: {e}', 500
+
+if __name__ == '__main__':
+    # Cloud Run populates the PORT environment variable
+    port = int(os.environ.get('PORT', 8080))
+    app.run(debug=True, host='0.0.0.0', port=port)
