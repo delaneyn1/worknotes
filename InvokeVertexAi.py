@@ -1,31 +1,19 @@
-import functions_framework
-import vertexai
-from vertexai.generative_models import GenerativeModel
-from google.cloud import storage
-
-vertexai.init(project="spiritual-slate-475417-t1", location="us-central1")
-
-model = GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=[
-        "Summarize the following document in a single sentence. Do not respond with more than one sentence.",
-    ],
+from google import genai
+from google.genai import types
+client = genai.Client(
+  vertexai=True, project="YOUR_PROJECT_ID", location="YOUR_LOCATION",
 )
-
-# Triggered by a change in a storage bucket
-@functions_framework.cloud_event
-def hello_gcs(cloud_event):
-    data = cloud_event.data
-
-    # download the file
-    storage_client = storage.Client()
-    blob = storage_client.bucket(data["bucket"]).get_blob(data["name"])
-    #print(blob)
-
-    doc = blob.download_as_text()
-    contents = [doc]
-
-    response = model.generate_content(contents)
-    print(response.text)
-
-    print(f"Response from Model: {response.text}")
+# If your image is stored in Google Cloud Storage, you can use the from_uri class method to create a Part object.
+IMAGE_URI = "gs://generativeai-downloads/images/scones.jpg"
+model = "gemini-2.0-flash-001"
+response = client.models.generate_content(
+  model=model,
+  contents=[
+    "What is shown in this image?",
+    types.Part.from_uri(
+      file_uri=IMAGE_URI,
+      mime_type="image/png",
+    ),
+  ],
+)
+print(response.text, end="")
