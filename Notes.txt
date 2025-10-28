@@ -1,0 +1,8 @@
+# worknotes
+Repo to keep things clean and organized for work
+
+InvokeVertexAi.pi is phase one of initial testing. It is really a proof of Concept to build off of. One successful Vertex implementation as a foundation to grow from.
+
+PhaseTwoTesting.py is the first integration of packaging up the generated contents then delivering it to an outbound bucket
+
+PhaseThreeTesting.py is the first steps towards implementing a ai generated file strucutre inside the outbound bucket
