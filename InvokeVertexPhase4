@@ -1,0 +1,309 @@
+import functions_framework
+import vertexai
+from vertexai.generative_models import GenerativeModel
+from google.cloud import storage
+import os
+import datetime
+import json
+import traceback
+import re # Added for the robust_json_loads function
+
+# --- Vertex AI Initialization ---
+PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "projectID")
+LOCATION = os.environ.get("GCP_REGION", "us-east1")
+
+vertexai.init(project=PROJECT_ID, location=LOCATION)
+
+# --- CONFIGURATION: FIELDS TO BE TRANSLATED BY LLM ---
+# Add or remove field names here as needed.
+# The LLM's system_instruction must contain rules for each field listed here.
+FIELDS_TO_TRANSLATE = ["gender", "status", "country_code"] # Example: Added 'status' and 'country_code'
+
+
+# Initialize the Generative Model
+model = GenerativeModel(
+    model_name="gemini-2.5-flash",
+    system_instruction=[
+        """
+    You are an expert data formatter. Your task is to process a JSON array of objects.
+    Each input object will contain 'record_id', 'field_name', and 'original_value'.
+
+    For each input object, you must translate its 'original_value' based on the 'field_name' and the specific rules provided below.
+
+    Translation Rules:
+    1.  For 'field_name': "gender"
+        -   Translate to "MALE", "FEMALE", or "OTHER".
+        -   Examples: "m", "Male", "man", "M" should become "MALE".
+        -   "f", "Female", "woman", "F" should become "FEMALE".
+        -   Any other value (e.g., "unknown", "na", empty string) should become "OTHER".
+
+    2.  For 'field_name': "status"
+        -   Translate to "ACTIVE", "INACTIVE", or "DELETED".
+        -   Examples: "A", "Active", "Running" -> "ACTIVE"; "I", "Inactive", "Stopped" -> "INACTIVE"; "D", "Del", "Removed" -> "DELETED"; anything else -> "INACTIVE".
+
+    3.  For 'field_name': "country_code"
+        -   Translate 2-letter ISO codes to 3-letter ISO codes.
+        -   Examples: "US" -> "USA"; "CA" -> "CAN"; "GB" -> "GBR"; "FR" -> "FRA".
+        -   If a direct 3-letter code is provided (e.g., "USA"), keep it as is.
+        -   If an unknown 2-letter code is provided, return "UNK".
+        -   If the value is already 'UNK', keep it as 'UNK'.
+
+    Your response MUST be a JSON array of objects. Each output object MUST contain the following four fields:
+    -   'record_id': The record_id from the original input object.
+    -   'field_name': The field_name from the original input object.
+    -   'original_value': The original_value from the input object.
+    -   'translated_value': The newly formatted value based on the rules.
+
+    Crucially, your response MUST contain ONLY the JSON array. Do NOT include any conversational text, explanations, or markdown fences (```json) around the JSON. Just the raw JSON array.
+    """,
+    ],
+)
+
+# Define output bucket name from environment variable (best practice)
+OUTPUT_BUCKET_NAME = os.environ.get('OUTPUT_BUCKET_NAME', 'curated-data-bucket')
+RAW_DATA_BUCKET_NAME = os.environ.get('RAW_DATA_BUCKET_NAME', 'uncurated-data-bucket') # Used for validation
+
+# Initialize GCS client
+storage_client = storage.Client()
+
+# --- Utility Functions for JSON Processing ---
+
+# FIXED: Generic recursive function to find specific variable instances for LLM input
+def find_variable_instances_for_llm(data, target_key, target_id_key="raw_record_id", current_id=None): # <--- FIX IS HERE
+    found_instances = []
+    if isinstance(data, dict):
+        # Update current_id if a new ID is found in the current dict
+        if target_id_key in data:
+            current_id = data[target_id_key]
+
+        for key, value in data.items():
+            if key == target_key:
+                instance_info = {
+                    "record_id": current_id,       # Use a generic 'record_id' for the LLM
+                    "field_name": target_key,      # Tell the LLM WHICH field this is
+                    "original_value": value        # The value to be translated
+                }
+                found_instances.append(instance_info)
+            # Recurse, passing the current_id down
+            found_instances.extend(find_variable_instances_for_llm(value, target_key, target_id_key, current_id))
+    elif isinstance(data, list):
+        for item in data:
+            # When recursing into a list item, continue with the current_id from the parent
+            found_instances.extend(find_variable_instances_for_llm(item, target_key, target_id_key, current_id))
+    return found_instances
+
+# NEW: Generic recursive function to apply translated values back to the document
+def apply_translations(data_to_update, translation_map, target_id_key="raw_record_id", current_id=None):
+    if isinstance(data_to_update, dict):
+        if target_id_key in data_to_update:
+            current_id = data_to_update[target_id_key]
+
+        for key, value in data_to_update.items():
+            if current_id is not None:
+                # The map_key needs to match how it was stored in the translation_map
+                map_key = (current_id, key, value)
+                if map_key in translation_map:
+                    data_to_update[key] = translation_map[map_key] # Apply the translation
+            # Recurse, passing the current_id down
+            apply_translations(value, translation_map, target_id_key, current_id)
+    elif isinstance(data_to_update, list):
+        for item in data_to_update:
+            apply_translations(item, translation_map, target_id_key, current_id)
+
+# Robust JSON Loader Function (kept from previous iteration)
+def robust_json_loads(json_string):
+    """
+    Attempts to parse a JSON string, including attempts to strip common LLM-added text.
+    """
+    json_string = json_string.strip()
+    if json_string.startswith("```json"):
+        json_string = json_string[len("```json"):].strip()
+    if json_string.endswith("```"):
+        json_string = json_string[:-len("```")].strip()
+
+    try:
+        return json.loads(json_string)
+    except json.JSONDecodeError as e:
+        print(f"Initial JSON decode failed: {e}")
+        fixed_json_string = re.sub(r',\s*([}\]])', r'\1', json_string)
+        try:
+            return json.loads(fixed_json_string)
+        except json.JSONDecodeError as e_fixed:
+            print(f"Attempted fix failed: {e_fixed}")
+            raise json.JSONDecodeError(f"Could not parse or repair JSON: {e_fixed}", json_string, e_fixed.pos)
+
+
+# --- Cloud Function Entrypoint ---
+@functions_framework.cloud_event
+def hello_gcs(cloud_event):
+    data = cloud_event.data
+
+    if not data or 'name' not in data or 'bucket' not in data:
+        print("Invalid Cloud Storage event payload.")
+        return
+
+    input_bucket_name = data["bucket"]
+    input_file_name = data["name"]
+
+    print(f"Processing file: {input_file_name} from bucket: {input_bucket_name}")
+
+    if input_bucket_name != RAW_DATA_BUCKET_NAME:
+        print(f"Skipping file {input_file_name}: not from expected raw data bucket {RAW_DATA_BUCKET_NAME}.")
+        return
+
+    original_document_string = ""
+    original_json_data = None
+    scrapy_spider_name = "unknown_spider"
+    
+    try:
+        blob = storage_client.bucket(input_bucket_name).get_blob(input_file_name)
+
+        if not blob:
+            print(f"Error: File {input_file_name} not found in bucket {input_bucket_name}")
+            return
+
+        original_document_string = blob.download_as_text()
+        print(f"Downloaded {input_file_name} (size: {len(original_document_string)} bytes)")
+
+        try:
+            original_json_data = json.loads(original_document_string)
+            print(f"Document {input_file_name} is valid JSON.")
+            scrapy_spider_name = original_json_data.get("scrapy_spider", "unknown_spider")
+        except json.JSONDecodeError:
+            print(f"Warning: Document {input_file_name} is NOT a valid JSON. "
+                  "Structured extraction and merging will be skipped.")
+            search_string = '"scrapy_spider": "'
+            start_index = original_document_string.find(search_string)
+            if start_index != -1:
+                start_index += len(search_string)
+                end_index = original_document_string.find('"', start_index)
+                if end_index != -1:
+                    scrapy_spider_name = original_document_string[start_index:end_index]
+                    print(f"Found scrapy_spider via string search: {scrapy_spider_name}")
+                else:
+                    print("Could not find closing quote for scrapy_spider value via string search.")
+            else:
+                print("Could not find 'scrapy_spider' string in document.")
+                
+        print(f"Extracted scrapy_spider: {scrapy_spider_name}")
+
+
+        # --- LLM INPUT PREPARATION: GENERALIZED EXTRACTION ---
+        llm_input_data_for_translation = []
+        
+        if original_json_data:
+            for field_name in FIELDS_TO_TRANSLATE:
+                # Initial call to find_variable_instances_for_llm, current_id defaults to None
+                llm_input_data_for_translation.extend(
+                    find_variable_instances_for_llm(original_json_data, field_name, "raw_record_id")
+                )
+            llm_input_string = json.dumps(llm_input_data_for_translation, indent=2)
+            print(f"Prepared LLM input for translation:\n{llm_input_string}")
+        else:
+            print("Skipping structured data extraction for LLM due to invalid input JSON.")
+            llm_input_string = "[]"
+
+
+        # Step 2: Call the Vertex AI model for generalized translation
+        print("Calling Vertex AI model for generalized translation...")
+        
+        response = model.generate_content(
+            [llm_input_string],
+            generation_config=vertexai.generative_models.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.2
+            )
+        )
+        
+        translated_data_list_string = response.text
+        print("\n--- FULL LLM RESPONSE (Translated Data List) ---")
+        print(translated_data_list_string)
+        print("---------------------------------------------------\n")
+
+        # Step 3: Parse the LLM's response and create the generic translation map
+        generic_translation_map = {}
+        processed_output_data = None
+        final_output_string_for_gcs = ""
+        output_content_type = "text/plain"
+
+        if original_json_data:
+            translated_data_from_llm = []
+            try:
+                parsed_llm_response = robust_json_loads(translated_data_list_string)
+                if isinstance(parsed_llm_response, list):
+                    translated_data_from_llm = parsed_llm_response
+                    print("LLM response parsed as valid list of translated data.")
+                else:
+                    print("Warning: LLM response is not a JSON list. Cannot merge structured data.")
+            except json.JSONDecodeError as e:
+                print(f"Error: LLM response is not valid JSON even after repair attempts: {e}. Cannot merge translations.")
+            
+            if translated_data_from_llm:
+                for item in translated_data_from_llm:
+                    record_id = item.get("record_id")
+                    field_name = item.get("field_name")
+                    original_value = item.get("original_value")
+                    translated_value = item.get("translated_value")
+
+                    if all([record_id, field_name, original_value, translated_value]):
+                        map_key = (record_id, field_name, original_value)
+                        generic_translation_map[map_key] = translated_value
+                    else:
+                        print(f"Warning: Translated item missing required fields for merge: {item}")
+                
+                print(f"Generated generic translation map (first 5 entries):\n"
+                      f"{json.dumps(list(generic_translation_map.items())[:5], indent=2)}")
+
+
+                # Step 4: Update the original JSON document with translated values
+                modified_data = json.loads(original_document_string)
+                # Initial call to apply_translations, current_id defaults to None
+                apply_translations(modified_data, generic_translation_map, "raw_record_id")
+                
+                processed_output_data = modified_data
+                output_content_type = "application/json"
+                print("Successfully merged all translated data into original JSON.")
+            else:
+                print("No translated data available from LLM for merge. Storing original JSON.")
+                processed_output_data = original_json_data
+                output_content_type = "application/json"
+        else:
+            print("Original document was not JSON. Attempting to save LLM's raw response.")
+            final_output_string_for_gcs = translated_data_list_string
+            output_content_type = "text/plain"
+            
+
+        # Final serialization step before upload
+        if processed_output_data is not None:
+            final_output_string_for_gcs = json.dumps(processed_output_data, indent=4)
+            output_content_type = "application/json"
+        elif not final_output_string_for_gcs:
+            final_output_string_for_gcs = original_document_string
+            try:
+                json.loads(original_document_string)
+                output_content_type = "application/json"
+            except json.JSONDecodeError:
+                output_content_type = "text/plain"
+
+
+        # --- Save the processed content to the output bucket ---
+        output_bucket = storage_client.bucket(OUTPUT_BUCKET_NAME)
+
+        current_date = datetime.date.today().strftime("%Y%m%d")
+        output_file_name_base = input_file_name.split('/')[-1].replace('.json', '')
+
+        if output_content_type == "application/json":
+            output_file_name = f"{scrapy_spider_name}_{current_date}_{output_file_name_base}_curated.json"
+        else:
+            output_file_name = f"{scrapy_spider_name}_{current_date}_{output_file_name_base}_llm_response.txt"
+
+        output_blob = output_bucket.blob(output_file_name)
+        output_blob.upload_from_string(final_output_string_for_gcs, content_type=output_content_type)
+
+        print(f"Successfully saved content to gs://{OUTPUT_BUCKET_NAME}/{output_file_name}")
+        return 'OK', 200
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        traceback.print_exc()
+        return f"Error: {e}", 500
